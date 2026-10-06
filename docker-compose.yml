@@ -1,0 +1,220 @@
+name: eventyay-next
+
+x-app-build: &app-build
+  context: ./app
+  # Expose repo root so Dockerfile can read EVY_NPM_DEV from .env.dev at build time.
+  additional_contexts:
+    project_root: .
+
+services:
+  web:
+    build: *app-build
+    platform: linux/amd64
+    container_name: eventyay-next-web
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./app/eventyay:/usr/src/app/eventyay
+      - ./app/entrypoint.sh:/usr/src/app/entrypoint.sh
+      - ./app/tests:/usr/src/app/tests
+      - ./plugins:/usr/src/plugins
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
+      - /usr/src/app/eventyay/static/schedule-editor
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
+      - /usr/src/plugins/eventyay-checkin/node_modules
+    ports:
+      - 8000:8000
+      - 8080:8080
+      - 8082:8082
+      - 8085:8085
+      - 8880:8880
+    env_file:
+      - ./.env.dev
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: *app-build
+    platform: linux/amd64
+    container_name: eventyay-next-worker
+    # Dev: one worker on all queues. Production uses worker + worker-heavy (deployment/docker-compose.yml).
+    command: celery -A eventyay worker -l info -Q default,notifications,longrunning,background
+    volumes:
+      - ./app/eventyay:/usr/src/app/eventyay
+      - ./app/entrypoint.sh:/usr/src/app/entrypoint.sh
+      - ./plugins:/usr/src/plugins
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
+      - /usr/src/app/eventyay/static/schedule-editor
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
+      - /usr/src/plugins/eventyay-checkin/node_modules
+    env_file:
+      - ./.env.dev
+    environment:
+      - MPLCONFIGDIR=/tmp/matplotlib
+    depends_on:
+      - db
+      - redis
+
+  beat:
+    build: *app-build
+    platform: linux/amd64
+    container_name: eventyay-next-beat
+    command: celery -A eventyay beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    volumes:
+      - ./app/eventyay:/usr/src/app/eventyay
+      - ./app/entrypoint.sh:/usr/src/app/entrypoint.sh
+      - ./plugins:/usr/src/plugins
+      - /usr/src/app/eventyay/static.dist
+      - /usr/src/app/eventyay/static/video
+      - /usr/src/app/eventyay/static/schedule-editor
+      - /usr/src/app/eventyay/webapp/video/node_modules
+      - /usr/src/app/eventyay/webapp/schedule-editor/node_modules
+      - /usr/src/app/eventyay/webapp/schedule/node_modules
+    env_file:
+      - ./.env.dev
+    environment:
+      - MPLCONFIGDIR=/tmp/matplotlib
+    depends_on:
+      - db
+      - redis
+
+  redis:
+    image: redis:latest
+    platform: linux/amd64
+    container_name: eventyay-next-redis
+    restart: unless-stopped
+    volumes:
+      - rd:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+
+  db:
+    image: postgres:15
+    platform: linux/amd64
+    container_name: eventyay-next-db
+    command: postgres -c max_connections=500
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data/
+    env_file:
+      - ./.env.dev
+
+  # --- VIDEO TEST SERVERS ---
+  janus:
+    image: canyan/janus-gateway:latest
+    platform: linux/amd64
+    container_name: eventyay-janus
+    restart: unless-stopped
+    ports:
+      - "8188:8188"
+      - "8088:8088"
+      - "7088:7088"
+      - "20000-20050:20000-20050/udp"
+    env_file:
+      - ./.env.dev
+
+  coturn:
+    image: coturn/coturn:latest
+    platform: linux/amd64
+    container_name: eventyay-coturn
+    restart: unless-stopped
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "5349:5349/tcp"
+      - "5349:5349/udp"
+    command:
+      - -a
+      - -v
+      - -n
+      - -u
+      - eventyay:eventyay_coturn_secret
+      - -r
+      - localhost
+      - --static-auth-secret=eventyay_coturn_secret
+    env_file:
+      - ./.env.dev
+
+  jitsi-prosody:
+    image: jitsi/prosody:stable-10888
+    platform: linux/amd64
+    container_name: eventyay-jitsi-prosody
+    restart: unless-stopped
+    expose:
+      - "5222"
+      - "5269"
+      - "5347"
+      - "5280"
+    volumes:
+      - eventyay_jitsi_prosody_config:/config
+    env_file:
+      - ./.env.dev
+    networks:
+      default:
+        aliases:
+          - xmpp.meet.jitsi
+
+  jitsi-jicofo:
+    image: jitsi/jicofo:stable-10888
+    platform: linux/amd64
+    container_name: eventyay-jitsi-jicofo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8889:8888"
+    volumes:
+      - eventyay_jitsi_jicofo_config:/config
+    env_file:
+      - ./.env.dev
+    depends_on:
+      - jitsi-prosody
+
+  jitsi-jvb:
+    image: jitsi/jvb:stable-10888
+    platform: linux/amd64
+    container_name: eventyay-jitsi-jvb
+    restart: unless-stopped
+    ports:
+      - "10001:10001/udp"
+      - "127.0.0.1:8091:8080"
+    volumes:
+      - eventyay_jitsi_jvb_config:/config
+    env_file:
+      - ./.env.dev
+    depends_on:
+      - jitsi-prosody
+
+  jitsi-web:
+    image: jitsi/web:stable-10888
+    platform: linux/amd64
+    container_name: eventyay-jitsi-web
+    restart: unless-stopped
+    ports:
+      - "8002:80"
+      - "8443:443"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /config
+        printf "config.bosh = '/http-bind';\nconfig.websocket = 'ws://localhost:8002/xmpp-websocket';\n" > /config/custom-config.js
+        exec /init
+    volumes:
+      - eventyay_jitsi_web_config:/config
+    env_file:
+      - ./.env.dev
+    depends_on:
+      - jitsi-jvb
+
+volumes:
+  postgres_data_dev:
+  rd:
+  eventyay_jitsi_prosody_config:
+  eventyay_jitsi_jicofo_config:
+  eventyay_jitsi_jvb_config:
+  eventyay_jitsi_web_config:
+

@@ -1,0 +1,518 @@
+from __future__ import annotations
+
+import datetime as dt
+import json
+import xml.etree.ElementTree as ElementTree
+from typing import TYPE_CHECKING, TypedDict
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
+
+import vobject
+from django.conf import settings
+from django.template.loader import get_template
+from django.utils.functional import cached_property
+from django.utils.safestring import SafeString
+from django.utils.translation import gettext_lazy as _
+from i18nfield.utils import I18nJSONEncoder
+
+from eventyay.agenda.export_resources import frab_public_resource_attachments, frab_public_resource_links
+from eventyay import __version__
+from eventyay.base.models.profile import SpeakerProfile
+from eventyay.base.models.submission import Submission
+from eventyay.common.exporter import BaseExporter
+from eventyay.common.urls import get_base_url
+from eventyay.common.utils.language import localize_event_text
+
+
+if TYPE_CHECKING:
+    from eventyay.base.models.schedule import Schedule
+    from eventyay.base.models.slot import TalkSlot
+
+
+def filter_featured_public_talk_slots(queryset):
+    """Limit talk slots to featured sessions with a visible, non-deleted room."""
+    return queryset.filter(
+        submission__is_featured=True,
+        room__isnull=False,
+    ).exclude(room__deleted=True)
+
+
+class RoomData(TypedDict):
+    id: int
+    guid: str
+    name: str
+    description: str | None
+    position: int | None
+    talks: list[TalkSlot]
+
+
+class PreparedData(TypedDict):
+    index: int
+    start: dt.datetime
+    end: dt.datetime
+    first_start: dt.datetime | None
+    last_end: dt.datetime | None
+    rooms: dict[str, RoomData]
+
+
+class ScheduleData(BaseExporter):
+    def __init__(self, event, schedule: Schedule | None = None, with_accepted=False, with_breaks=False):
+        super().__init__(event)
+        self.schedule = schedule
+        self.with_accepted = with_accepted
+        self.with_breaks = with_breaks
+
+    @cached_property
+    def metadata(self):
+        if not self.schedule:
+            return []
+
+        return {
+            'url': self.event.urls.schedule.full(),
+            'base_url': get_base_url(self.event),
+        }
+
+    @cached_property
+    def data(self) -> tuple[PreparedData, ...]:
+        if not self.schedule:
+            return []
+
+        event = self.event
+        schedule = self.schedule
+
+        base_qs = schedule.talks.all() if self.with_accepted else schedule.talks.filter(is_visible=True)
+        if getattr(self, 'featured_only', False):
+            base_qs = filter_featured_public_talk_slots(base_qs)
+        talks = (
+            base_qs.select_related(
+                'submission',
+                'submission__event',
+                'submission__submission_type',
+                'submission__track',
+                'room',
+            )
+            .prefetch_related(
+                'submission__speakers',
+                # TODO: This prefetch can be redundant for some classes derived from ScheduleData,
+                # but the current subclass hierarchy make it difficult to refactor.
+                # Will improve it in the future.
+                'submission__resources',
+            )
+            .order_by('start')
+            .exclude(submission__state='deleted')
+        )
+        data = {
+            current_date.date(): {
+                'index': index + 1,
+                'start': current_date.replace(hour=4, minute=0).astimezone(event.tz),
+                'end': current_date.replace(hour=3, minute=59).astimezone(event.tz) + dt.timedelta(days=1),
+                'first_start': None,
+                'last_end': None,
+                'rooms': {},
+            }
+            for index, current_date in enumerate(
+                event.datetime_from + dt.timedelta(days=days)
+                for days in range((event.date_to - event.date_from).days + 1)
+            )
+        }
+
+        # date_from is a datetime, so compare calendar dates. Otherwise every
+        # talk before 03:00 fails the first-day check and drops off the grid.
+        event_start_date = event.datetime_from.date()
+        for talk in talks:
+            if not talk.start or not talk.room or talk.room.deleted or (not talk.submission and not self.with_breaks):
+                continue
+            talk_date = talk.local_start.date()
+            if talk.local_start.hour < 3 and talk_date != event_start_date:
+                talk_date -= dt.timedelta(days=1)
+            day_data = data.get(talk_date)
+            if not day_data:
+                continue
+            room_name = localize_event_text(talk.room.name)
+            room_key = str(room_name)
+            if room_key not in day_data['rooms']:
+                day_data['rooms'][room_key] = {
+                    'id': talk.room.id,
+                    'guid': talk.room.uuid,
+                    'name': room_name,
+                    'description': localize_event_text(talk.room.description),
+                    'position': talk.room.position,
+                    'talks': [talk],
+                }
+            else:
+                day_data['rooms'][room_key]['talks'].append(talk)
+            if not day_data['first_start'] or talk.start < day_data['first_start']:
+                day_data['first_start'] = talk.start
+            if not day_data['last_end'] or talk.local_end > day_data['last_end']:
+                day_data['last_end'] = talk.local_end
+
+        for day in data.values():
+            day['rooms'] = sorted(
+                day['rooms'].values(),
+                key=lambda room: room['position'] if room['position'] is not None else room['id'],
+            )
+        return tuple(data.values())
+
+
+class FrabXmlExporter(ScheduleData):
+    identifier = 'schedule.xml'
+    verbose_name = 'XML (frab compatible)'
+    public = True
+    show_qrcode = True
+    favs_retrieve = False
+    talk_ids = frozenset()
+    icon = 'fa-code'
+    cors = '*'
+
+    def render(self, **kwargs):
+        context = {
+            'data': self.data,
+            'metadata': self.metadata,
+            'schedule': self.schedule,
+            'event': self.event,
+            'version': __version__,
+            'base_url': get_base_url(self.event),
+        }
+        content = get_template('agenda/schedule.xml').render(context=context)
+        if self.favs_retrieve:
+            root = ElementTree.fromstring(content)
+            for day in root.findall('day'):
+                for room in day.findall('room'):
+                    for event in room.findall('event'):
+                        event_slug = event.find('url').text.split('/')[-2]
+                        if event_slug not in self.talk_ids:
+                            room.remove(event)
+            filtered_xml_data = ElementTree.tostring(root, encoding='unicode')
+            content = SafeString(filtered_xml_data)
+        return f'{self.event.slug}-schedule.xml', 'text/xml', content
+
+
+class MyFrabXmlExporter(FrabXmlExporter):
+    identifier = 'schedule-my.xml'
+    verbose_name = 'My ⭐ Sessions XML'
+    favs_retrieve = True
+
+
+class FrabXCalExporter(ScheduleData):
+    identifier = 'schedule.xcal'
+    verbose_name = 'XCal (frab compatible)'
+    public = True
+    show_qrcode = True
+    favs_retrieve = False
+    talk_ids = frozenset()
+    icon = 'fa-calendar'
+    cors = '*'
+
+    def render(self, **kwargs):
+        url = get_base_url(self.event)
+        context = {'data': self.data, 'url': url, 'domain': urlparse(url).netloc}
+        content = get_template('agenda/schedule.xcal').render(context=context)
+        if self.favs_retrieve:
+            root = ElementTree.fromstring(content)
+            for vcalendar in root.findall('vcalendar'):
+                for vevent in vcalendar.findall('vevent'):
+                    event_uid = vevent.find('uid').text.split('@@')[0]
+                    if event_uid not in self.talk_ids:
+                        vcalendar.remove(vevent)
+            filtered_xcal_data = ElementTree.tostring(root, encoding='unicode')
+            content = SafeString(filtered_xcal_data)
+        return f'{self.event.slug}.xcal', 'text/xml', content
+
+
+class MyFrabXCalExporter(FrabXCalExporter):
+    identifier = 'schedule-my.xcal'
+    verbose_name = 'My ⭐ Sessions XCAL'
+    favs_retrieve = True
+
+
+class FrabJsonExporter(ScheduleData):
+    identifier = 'schedule.json'
+    verbose_name = 'JSON (frab compatible)'
+    public = True
+    show_qrcode = True
+    favs_retrieve = False
+    talk_ids = frozenset()
+    icon = 'fa-code'
+    cors = '*'
+
+    def speaker_ids(self) -> set[int]:
+        # Must match the exact talk set that is actually exported via ``self.data``.
+        # (This keeps speaker profile prefetch aligned with the exported schedule.)
+        submission_ids: set[int] = set()
+        for day in self.data:
+            for room in day['rooms']:
+                for talk in room['talks']:
+                    if not talk.submission_id:
+                        continue
+                    if (
+                        self.favs_retrieve
+                        and self.talk_ids
+                        and talk.submission
+                        and talk.submission.code not in self.talk_ids
+                    ):
+                        continue
+                    submission_ids.add(talk.submission_id)
+
+        if not submission_ids:
+            return set()
+
+        return set(
+            Submission.objects.filter(id__in=submission_ids)
+            .values_list('speakers__id', flat=True)
+            .exclude(speakers__id__isnull=True)
+            .distinct()
+        )
+
+    @cached_property
+    def speaker_profiles(self) -> dict[int, SpeakerProfile]:
+        """Prefetch all speaker profiles for this event to avoid N+1 queries."""
+
+        if not (speaker_ids := self.speaker_ids()):
+            return {}
+
+        return {
+            profile.user_id: profile
+            for profile in SpeakerProfile.objects.filter(event=self.event, user_id__in=speaker_ids).select_related(
+                'user', 'event'
+            )
+        }
+
+    def get_speaker_profile(self, person):
+        """Look up a prefetched speaker profile, falling back to event_profile()."""
+        profile = self.speaker_profiles.get(person.pk)
+        if profile is not None:
+            return profile
+        return person.event_profile(self.event)
+
+    def get_data(self, **kwargs):
+        schedule = self.schedule
+        return {
+            'url': self.metadata['url'],
+            'version': schedule.version,
+            'base_url': self.metadata['base_url'],
+            'conference': {
+                'acronym': self.event.slug,
+                'title': localize_event_text(self.event.name),
+                'start': self.event.date_from.strftime('%Y-%m-%d'),
+                'end': self.event.date_to.strftime('%Y-%m-%d'),
+                'daysCount': self.event.duration,
+                'timeslot_duration': '00:05',
+                'time_zone_name': self.event.timezone,
+                'colors': {'primary': self.event.visible_primary_color or '#2185d0'},
+                'rooms': [
+                    {
+                        'name': localize_event_text(room.name),
+                        'slug': room.slug,
+                        # TODO room url
+                        'guid': room.uuid,
+                        'description': localize_event_text(room.description) or None,
+                        'capacity': room.capacity,
+                    }
+                    for room in self.event.rooms.all()
+                ],
+                'tracks': [
+                    {
+                        'name': localize_event_text(track.name),
+                        'slug': track.slug,
+                        'color': track.color,
+                    }
+                    for track in self.event.tracks.all()
+                ],
+                'days': [
+                    {
+                        'index': day['index'],
+                        'date': day['start'].strftime('%Y-%m-%d'),
+                        'day_start': day['start'].astimezone(self.event.tz).isoformat(),
+                        'day_end': day['end'].astimezone(self.event.tz).isoformat(),
+                        'rooms': {
+                            str(room['name']): [
+                                self.serialize_talk(talk, room)
+                                for talk in room['talks']
+                                if (self.favs_retrieve is True and talk.submission.code in self.talk_ids)
+                                or not self.favs_retrieve
+                            ]
+                            for room in day['rooms']
+                        },
+                    }
+                    for day in self.data
+                ],
+            },
+        }
+
+    def serialize_talk(self, talk, room):
+        persons = []
+        for person in talk.submission.speakers.all():
+            profile = self.get_speaker_profile(person)
+            persons.append(
+                {
+                    'code': person.code,
+                    'name': person.get_display_name(),
+                    'avatar': person.get_avatar_url(self.event) or None,
+                    'biography': localize_event_text(profile.biography),
+                    'public_name': person.get_display_name(),  # deprecated
+                    'guid': person.guid,
+                    'url': profile.urls.public.full(),
+                }
+            )
+        return {
+            'guid': talk.uuid,
+            'code': talk.submission.code,
+            'id': talk.submission.id,
+            'logo': (talk.submission.urls.image.full() if talk.submission.image else None),
+            'date': talk.local_start.isoformat(),
+            'start': talk.local_start.strftime('%H:%M'),
+            'duration': talk.export_duration,
+            'room': localize_event_text(room['name']),
+            'slug': talk.frab_slug,
+            'url': talk.submission.urls.public.full(),
+            'title': localize_event_text(talk.submission.title),
+            'subtitle': '',
+            'track': (localize_event_text(talk.submission.track.name) if talk.submission.track else None),
+            'type': localize_event_text(talk.submission.submission_type.name),
+            'language': talk.submission.content_locale,
+            'abstract': localize_event_text(talk.submission.abstract),
+            'description': localize_event_text(talk.submission.description),
+            'recording_license': '',
+            'do_not_record': talk.submission.do_not_record,
+            'persons': persons,
+            'links': frab_public_resource_links(talk.submission, self.event),
+            'feedback_url': talk.submission.urls.feedback.full(),
+            'origin_url': talk.submission.urls.public.full(),
+            'attachments': frab_public_resource_attachments(talk.submission, self.event),
+        }
+
+    def render(self, **kwargs):
+        content = self.get_data()
+        return (
+            f'{self.event.slug}.json',
+            'application/json',
+            json.dumps(
+                {
+                    '$schema': 'https://c3voc.de/schedule/schema.json',
+                    'generator': {'name': 'pretalx', 'version': __version__},
+                    'schedule': content,
+                },
+                cls=I18nJSONEncoder,
+            ),
+        )
+
+
+class MyFrabJsonExporter(FrabJsonExporter):
+    identifier = 'schedule-my.json'
+    verbose_name = 'My ⭐ Sessions JSON'
+    favs_retrieve = True
+
+
+class ICalExporter(BaseExporter):
+    identifier = 'schedule.ics'
+    verbose_name = _('iCal (full event)')
+    public = True
+    show_public = True
+    show_qrcode = True
+    favs_retrieve = False
+    talk_ids = frozenset()
+    icon = 'fa-calendar'
+    cors = '*'
+
+    def __init__(self, event, schedule=None):
+        super().__init__(event)
+        self.schedule = schedule
+
+    def render(self, **kwargs):
+        netloc = urlparse(get_base_url(self.event)).netloc
+        cal = vobject.iCalendar()
+        cal.add('prodid').value = f'-//pretalx//{netloc}//'
+        creation_time = dt.datetime.now(ZoneInfo('UTC'))
+
+        talks = (
+            self.schedule.talks.filter(is_visible=True)
+            .prefetch_related('submission__speakers')
+            .select_related('submission', 'room', 'submission__event')
+            .order_by('start')
+        )
+        if getattr(self, 'featured_only', False):
+            talks = filter_featured_public_talk_slots(talks)
+        for talk in talks:
+            if self.favs_retrieve and talk.submission and talk.submission.code not in self.talk_ids:
+                continue
+            talk.build_ical(cal, creation_time=creation_time, netloc=netloc)
+
+        return f'{self.event.slug}.ics', 'text/calendar', cal.serialize()
+
+
+class MyICalExporter(ICalExporter):
+    identifier = 'schedule-my.ics'
+    verbose_name = 'My ⭐ Sessions iCal'
+    favs_retrieve = True
+
+
+class FavedICalExporter(BaseExporter):
+    identifier = 'faved.ics'
+    verbose_name = _('iCal (your starred sessions)')
+    show_qrcode = False
+    icon = 'fa-calendar'
+    show_public = True
+    cors = '*'
+    schedule = None
+
+    def is_public(self, request, **kwargs):
+        return (
+            'agenda' in request.resolver_match.namespaces
+            and request.user.is_authenticated
+            and request.user.has_perm('base.list_schedule', request.event)
+        )
+
+    def render(self, request, **kwargs):
+        if not request.user.is_authenticated:
+            return None
+
+        netloc = urlparse(settings.SITE_URL).netloc
+        schedule = self.schedule or request.event.current_schedule
+        if not schedule:
+            return None
+        slots = schedule.scheduled_talks.filter(submission__favourites__user__in=[request.user])
+        if getattr(self, 'featured_only', False):
+            slots = slots.filter(submission__is_featured=True)
+
+        cal = vobject.iCalendar()
+        cal.add('prodid').value = f'-//pretalx//{netloc}//{request.event.slug}//faved'
+
+        for slot in slots:
+            slot.build_ical(cal)
+        return f'{self.event.slug}-favs.ics', 'text/calendar', cal.serialize()
+
+
+class BaseCalendarExporter(BaseExporter):
+    public = True
+    show_qrcode = True
+    icon = 'fa-calendar'
+
+    @property
+    def show_public(self):
+        return self.ical_exporter_cls(self.event).show_public
+
+
+class GoogleCalendarExporter(BaseCalendarExporter):
+    identifier = 'google-calendar'
+    verbose_name = 'Subscribe to Google Calendar'
+    icon = 'fa-google'
+    ical_exporter_cls = ICalExporter
+
+
+class MyGoogleCalendarExporter(BaseCalendarExporter):
+    identifier = 'my-google-calendar'
+    verbose_name = 'Subscribe to My ⭐ Sessions in Google Calendar'
+    icon = 'fa-google'
+    ical_exporter_cls = MyICalExporter
+
+
+class WebcalExporter(BaseCalendarExporter):
+    identifier = 'webcal'
+    verbose_name = 'Subscribe to Other Calendar'
+    ical_exporter_cls = ICalExporter
+
+
+class MyWebcalExporter(BaseCalendarExporter):
+    identifier = 'my-webcal'
+    verbose_name = 'Subscribe to My ⭐ Sessions in Other Calendar'
+    ical_exporter_cls = MyICalExporter

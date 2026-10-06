@@ -1,0 +1,79 @@
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 15
+
+  - package-ecosystem: "uv"
+    directory: "/app"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 15
+    versioning-strategy: increase
+    groups:
+      # Keep documentation extras in dedicated PRs so they are not starved by
+      # the shared open-pull-requests-limit against the main dependency set.
+      documentation:
+        patterns:
+          - "pyenchant"
+          - "pygments-markdown-lexer"
+          - "sphinx*"
+    ignore:
+      # django-celery-beat 2.9.0 requires Django<6.1 and cron-descriptor<2.
+      - dependency-name: "django"
+        versions: [">=6.1.0"]
+      - dependency-name: "cron-descriptor"
+        versions: [">=1.4.5"]
+      - dependency-name: "stripe"
+        versions: [">=11.4.0"]
+      # Ignore all setuptools updates; issue is not version-specific.
+      # Can be removed once Dependabot handles no-op uv updates.
+      - dependency-name: "setuptools"
+      - dependency-name: "setuptools-rust"
+      # Git plugins are not on PyPI; pins are updated by update-plugin-pins.yml.
+      - dependency-name: "exhibition"
+      - dependency-name: "eventyay-paypal"
+      - dependency-name: "eventyay-stripe"
+      - dependency-name: "eventyay-bitpay"
+      - dependency-name: "eventyay-socialmedia"
+      - dependency-name: "eventyay-teamshifts"
+      - dependency-name: "eventyay-interpretation"
+      - dependency-name: "eventyay-hubspot"
+      - dependency-name: "eventyay-business"
+      - dependency-name: "eventyay-veditor"
+
+  - package-ecosystem: "npm"
+    directory: "/app/eventyay/webapp/video"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 15
+    groups:
+      # Group Tiptap packages together as they are tightly coupled and updated together.
+      tiptap:
+        patterns:
+          - "@tiptap/*"
+
+  - package-ecosystem: "npm"
+    directory: "/app/eventyay/webapp/schedule"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 15
+
+  - package-ecosystem: "npm"
+    directory: "/app/eventyay/webapp/schedule-editor"
+    schedule:
+      interval: "daily"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 15
